@@ -223,6 +223,137 @@ def build_youtube_comment(tracklist) -> str:
         # else: missing/invalid -> treat as 0 (keep same start for next)
     return "\n".join(lines)
 
+
+# --------- INSTAGRAM CAPTION ---------
+def slug_to_youtube_url(front: dict) -> str:
+    # Construct a YouTube watch URL if a youtubeId exists, otherwise fallback to show page
+    yid = front.get("youtubeId") or front.get("youtube_id") or front.get("youtube")
+    if yid:
+        return f"https://youtu.be/{yid}"
+    return build_show_url(front)
+
+def build_hashtags(front: dict, max_tags: int = 12) -> list:
+    tags = []
+    # Collect from explicit tags/genres/styles
+    for key in ("tags", "styles", "genres"):
+        v = front.get(key)
+        if isinstance(v, list):
+            tags.extend([str(x).strip() for x in v if str(x).strip()])
+        elif isinstance(v, str) and v.strip():
+            tags.extend([x.strip() for x in v.split(",") if x.strip()])
+
+    # Add notable artists as tags (first few words of artist names)
+    for a in extract_notable_artists(front.get("tracklist") or [], limit=6):
+        tags.append(a.split()[0])
+
+    # Normalize: lowercase, remove disallowed chars, dedupe while preserving order
+    seen = set()
+    out = []
+    for t in tags:
+        ht = re.sub(r"[^0-9A-Za-z]+", "", t).lower()
+        if not ht:
+            continue
+        if ht in seen:
+            continue
+        seen.add(ht)
+        out.append(f"#{ht}")
+        if len(out) >= max_tags:
+            break
+    return out
+
+def build_instagram_caption(front: dict) -> str:
+    """Build a short Instagram caption + hashtags for promoting the YouTube episode.
+
+    Structure:
+    - 1-3 line caption (hook, brief description, CTA)
+    - suggested hashtags block (8-12 tags)
+    - short host/IG credit lines if available
+    - link line (YouTube short link or show page)
+    """
+    title = str(front.get("title", "")).strip() or "Untitled Set"
+    hosts_raw = front.get("host") or front.get("hosts") or []
+    if isinstance(hosts_raw, str):
+        hosts = [h.strip() for h in hosts_raw.split(",") if h.strip()]
+    else:
+        hosts = hosts_raw or []
+
+    styles = pick_list(front)
+    first_style = styles[0] if styles else None
+
+    # Hook + brief
+    hook = f"{title} — {first_style}" if first_style else title
+    brief = f"A new episode of {CHANNEL_NAME} with {', '.join(hosts)}." if hosts else f"A new episode of {CHANNEL_NAME}."
+    # Instagram captions should not contain external clickable links; use 'link in bio' CTA
+    cta = "Link in bio."
+
+    hashtags = " ".join(build_hashtags(front, max_tags=12))
+
+    parts = [hook, brief, cta]
+    # No separate credits line (we'll prefer host names in the opening sentence)
+    if hashtags:
+        parts.append(hashtags)
+
+    return "\n\n".join(parts)
+
+
+def make_instagram_prompt(front: dict) -> str:
+    """Produce a ChatGPT prompt the user can paste into ChatGPT to generate an Instagram caption.
+
+    The returned string is an instruction followed by a 'DATA' block that includes
+    the front-matter fields the model should use. It also specifies strict output format.
+    """
+    title = str(front.get("title", "")).strip() or "Untitled Set"
+    hosts_raw = front.get("host") or front.get("hosts") or []
+    if isinstance(hosts_raw, str):
+        hosts = [h.strip() for h in hosts_raw.split(",") if h.strip()]
+    else:
+        hosts = hosts_raw or []
+
+    styles = pick_list(front)
+    tracklist = front.get("tracklist") or []
+
+    # Build small front matter summary to include in the instruction
+    fm_lines = [f"title: {title}"]
+    if hosts:
+        fm_lines.append(f"hosts: {', '.join(hosts)}")
+    if styles:
+        fm_lines.append(f"styles: {', '.join(styles)}")
+    if front.get("youtubeId"):
+        fm_lines.append(f"youtube: {front.get('youtubeId')}")
+    # include the full, formatted tracklist so the model sees every track
+    tl_lines = []
+    for i, t in enumerate(tracklist):
+        if not isinstance(t, dict):
+            continue
+        tt = t.get("title") or ""
+        ar = t.get("artist") or ""
+        yr = t.get("year") or ""
+        dur = t.get("duration_seconds") or ""
+        tl_lines.append(f"{i+1}. {tt} — {ar} ({yr}) [{dur}s]")
+
+    data_block = "\n".join([*fm_lines, "", "tracklist:"] + tl_lines)
+
+    instr = (
+        "You are an expert social copywriter for a vinyl DJ channel. "
+        "Using only the DATA provided, write an Instagram post promoting the YouTube episode. "
+        "Do not invent tracks or artists. Respect copyright and avoid clickbait."
+    )
+
+    constraints = (
+        "Output Format (MUST FOLLOW EXACTLY):\n"
+        "CAPTION:\n" "<A single caption block, 1-4 short paragraphs, <= 2200 characters>\n\n"
+        "HASHTAGS:\n" "<A single line of space-separated hashtags, 6-14 tags, each starting with #>\n\n"
+    )
+
+    guidance = (
+        "Tone: musical, warm, slightly poetic; use 1-2 emojis maximum.\n"
+        "Start the caption by naming the host(s) (DJ names) in the opening sentence.\n"
+        "Do NOT include clickable URLs in the caption; instead instruct readers that the link is in the bio.\n"
+        "Prefer style and era cues (e.g., ‘Afrobeat, Highlife’) in the opening sentence.\n"
+    )
+
+    return "\n\n".join([instr, constraints, guidance, "DATA:", data_block])
+
 # --------- PROMPT FACTORY ---------
 def make_prompt(front: dict) -> str:
     title     = str(front.get("title", "")).strip() or "Untitled Set"
@@ -271,7 +402,7 @@ Write a compelling YouTube TITLE and DESCRIPTION for a DJ vinyl-mix video, using
  - When natural, include a region or era cue inferred from the tracklist (e.g., “West Africa”, “70s Highlife”).
 
 # Description Requirements
-- Open with a refined, mood-forward paragraph (sophisticated but rhythmic); mention that it’s all-vinyl.
+- Open with a refined, mood-forward paragraph (sophisticated but rhythmic); mention that it’s all-vinyl and explicitly name the host(s) in the opening sentence.
 - Include these link blocks (exact labels):
   🔗 Learn more about this episode, full tracklist, and {CHANNEL_NAME}:
   {show_url}
@@ -306,6 +437,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate YouTube Title/Description prompt or a timestamped comment from MDX/YAML frontmatter")
     parser.add_argument("path", type=Path, help="Path to MDX/Markdown with YAML frontmatter, or a YAML file")
     parser.add_argument("--comment", action="store_true", help="Output a YouTube comment with timestamps from tracklist.duration_seconds")
+    parser.add_argument("--instagram", action="store_true", help="Output an Instagram caption + hashtags for the episode")
     args = parser.parse_args()
 
     path = args.path
@@ -321,6 +453,14 @@ def main():
             print("No tracklist found or could not build comment.", file=sys.stderr)
             sys.exit(2)
         print(comment)
+        return
+
+    if args.instagram:
+        prompt = make_instagram_prompt(front)
+        if not prompt:
+            print("Could not build Instagram prompt.", file=sys.stderr)
+            sys.exit(2)
+        print(prompt)
         return
 
     prompt = make_prompt(front)
